@@ -1,0 +1,18 @@
+name: qe
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - coverage
+  - numpy
+  - scipy
+  - pandas
+  # >=0.62: JIT coverage (NUMBA_JIT_COVERAGE) respects .coveragerc from 0.62 on
+  - numba>=0.62
+  - ipython
+  - flake8
+  - requests
+  - urllib3>=2
+  - flit
+  - chardet # python>3.9,osx
+  - pytest

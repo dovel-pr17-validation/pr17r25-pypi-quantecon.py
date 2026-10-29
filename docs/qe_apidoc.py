@@ -1,0 +1,462 @@
+"""
+Our version of sphinx-apidoc
+
+@author : Spencer Lyon
+@date : 2014-07-16
+
+This file should be called from the command line. It accepts one
+additional command line parameter. If we pass the parameter `single`
+when running the file, this file will create a single directory named
+modules where only the base-level modules of quantecon are documented.
+The index.rst file will then contain a single list of those modules;
+the subpackages (game_theory, markov, optimize, random, timings, util)
+are omitted, and setup/contributing are left out of the toctree. This
+mode is not used by `make html`.
+
+If no argument is passed, or if the argument is anything other than
+`single`, one directory is created per subpackage (game_theory,
+markov, optimize, random, timings, util) plus a `tools` directory for
+the base-level modules, and a top-level .rst per section. The
+generated index.rst then contains a single toctree listing setup, each
+section, and contributing.
+
+Examples
+--------
+$ python qe_apidoc.py  # generates the per-section directories
+$ python qe_apidoc.py foo_bar  # generates the per-section directories
+$ python qe_apidoc.py single  # generates the single directory
+
+
+Notes
+-----
+1. This file can also be run from within ipython using the %%run magic.
+To do this, use one of the commands above and replace `python` with
+`%%run`
+
+
+"""
+import ast
+import os
+import sys
+from glob import glob
+
+
+######################
+## String Templates ##
+######################
+
+module_template = """{mod_name}
+{equals}
+
+.. automodule:: quantecon.{mod_name}
+    :members:
+    :undoc-members:
+    :show-inheritance:
+"""
+
+# Base-level shim modules (e.g. ``quantecon.arma``) are documented by
+# their public objects in the ``quantecon`` namespace rather than by an
+# ``automodule`` directive -- see ``write_base_module`` for why.
+shim_module_header_template = """{mod_name}
+{equals}
+
+.. currentmodule:: quantecon
+"""
+
+autoclass_template = """
+.. autoclass:: {name}
+    :members:
+    :undoc-members:
+    :show-inheritance:
+"""
+
+autofunction_template = """
+.. autofunction:: {name}
+"""
+
+game_theory_module_template = """{mod_name}
+{equals}
+
+.. automodule:: quantecon.game_theory.{mod_name}
+    :members:
+    :undoc-members:
+    :show-inheritance:
+"""
+
+game_generators_module_template = """{mod_name}
+{equals}
+
+.. automodule:: quantecon.game_theory.game_generators.{mod_name}
+    :members:
+    :undoc-members:
+    :show-inheritance:
+"""
+
+markov_module_template = """{mod_name}
+{equals}
+
+.. automodule:: quantecon.markov.{mod_name}
+    :members:
+    :undoc-members:
+    :show-inheritance:
+"""
+
+optimize_module_template = """{mod_name}
+{equals}
+
+.. automodule:: quantecon.optimize.{mod_name}
+    :members:
+    :undoc-members:
+    :show-inheritance:
+"""
+
+random_module_template = """{mod_name}
+{equals}
+
+.. automodule:: quantecon.random.{mod_name}
+    :members:
+    :undoc-members:
+    :show-inheritance:
+"""
+
+util_module_template = """{mod_name}
+{equals}
+
+.. automodule:: quantecon.util.{mod_name}
+    :members:
+    :undoc-members:
+    :show-inheritance:
+"""
+
+timings_module_template = """{mod_name}
+{equals}
+
+.. automodule:: quantecon.timings.{mod_name}
+    :members:
+    :undoc-members:
+    :show-inheritance:
+"""
+
+all_index_template = """=======================
+QuantEcon documentation
+=======================
+
+Auto-generated documentation by module:
+
+.. toctree::
+   :maxdepth: 2
+
+   {generated}
+
+
+Indices and tables
+==================
+
+* :ref:`genindex`
+* :ref:`modindex`
+* :ref:`search`
+"""
+
+split_index_template = """=======================
+QuantEcon documentation
+=======================
+
+The `quantecon` python library consists of a number of modules which
+includes game theory (game_theory), markov chains (markov),
+optimization algorithms (optimize), random generation utilities
+(random), global timing-precision configuration (timings), a collection
+of tools (tools), and other utilities (util), which include user-facing
+timing tools (``Timer``, ``timeit``) alongside helpers used internally
+by the package.
+
+.. toctree::
+   :maxdepth: 2
+
+   setup
+   game_theory
+   markov
+   optimize
+   random
+   timings
+   tools
+   util
+   contributing
+
+Indices and tables
+==================
+
+* :ref:`genindex`
+* :ref:`modindex`
+* :ref:`search`
+"""
+
+split_file_template = """{name}
+{equals}
+
+.. toctree::
+   :maxdepth: 2
+
+   {files}
+"""
+
+######################
+## Helper functions ##
+######################
+
+
+def source_join(f_name):
+    return os.path.join("source", f_name)
+
+
+def _read_dunder_all(py_path):
+    """
+    Return the ``__all__`` list declared in ``py_path`` (via ``ast``, so
+    no import of the package is required), or ``None`` if there is none.
+    """
+    try:
+        tree = ast.parse(open(py_path).read())
+    except (OSError, SyntaxError):
+        return None
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == "__all__":
+                    try:
+                        return list(ast.literal_eval(node.value))
+                    except ValueError:
+                        return None
+    return None
+
+
+def _member_kinds(py_path):
+    """
+    Map each top-level name defined in ``py_path`` to ``"class"`` or
+    ``"function"`` by parsing (not importing) the source.
+    """
+    kinds = {}
+    try:
+        tree = ast.parse(open(py_path).read())
+    except (OSError, SyntaxError):
+        return kinds
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            kinds[node.name] = "class"
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            kinds[node.name] = "function"
+    return kinds
+
+
+def write_base_module(name, f):
+    """
+    Write the docs stub for a base-level module ``name`` to file ``f``.
+
+    Most base-level public modules (e.g. ``quantecon.arma``) are
+    deprecated compatibility shims that re-export their objects from a
+    private implementation module (e.g. ``quantecon._arma``). For those
+    we document the *public* objects in the ``quantecon`` namespace --
+    ``quantecon.ARMA`` rather than the deprecated shim
+    ``quantecon.arma.ARMA`` or the private ``quantecon._arma.ARMA`` --
+    via ``.. currentmodule:: quantecon`` plus explicit ``autoclass`` /
+    ``autofunction`` directives derived from the shim's ``__all__``. The
+    real docstrings live on the objects, so they still render, and the
+    deprecated shim is never imported during the build.
+
+    Genuinely public base modules (``distributions``, ``quad``) have no
+    ``_<name>.py`` implementation module and keep a plain ``automodule``
+    directive.
+    """
+    equals = "=" * len(name)
+    impl = os.path.join("..", "quantecon", "_" + name + ".py")
+    public_names = _read_dunder_all(os.path.join("..", "quantecon", name + ".py"))
+    if not (os.path.exists(impl) and public_names):
+        f.write(module_template.format(mod_name=name, equals=equals))
+        return
+
+    kinds = _member_kinds(impl)
+    f.write(shim_module_header_template.format(mod_name=name, equals=equals))
+    for obj in public_names:
+        if kinds.get(obj) == "class":
+            f.write(autoclass_template.format(name=obj))
+        else:
+            f.write(autofunction_template.format(name=obj))
+
+####################
+## Main functions ##
+####################
+
+
+def all_auto():
+    # Get list of module names
+    mod_names = glob("../quantecon/[a-z0-9]*.py")
+    mod_names = list(map(lambda x: x.split('/')[-1], mod_names))
+
+    # Ensure source/modules directory exists
+    if not os.path.exists(source_join("modules")):
+        os.makedirs(source_join("modules"))
+
+    # Write file for each module
+    for mod in mod_names:
+        name = mod.split(".")[0]  # drop .py ending
+        new_path = os.path.join("source", "modules", name + ".rst")
+        with open(new_path, "w") as f:
+            write_base_module(name, f)
+
+    # write index.rst file to include these autogenerated files
+    with open(source_join("index.rst"), "w") as index:
+        generated = "\n   ".join(list(map(lambda x: "modules/" + x.split(".")[0],
+                                     mod_names)))
+        temp = all_index_template.format(generated=generated)
+        index.write(temp)
+
+
+def model_tool():
+    # list file names with game_theory
+    game_theory_files = glob("../quantecon/game_theory/[a-z0-9]*.py")
+    game_theory = list(map(lambda x: x.split('/')[-1][:-3], game_theory_files))
+    # Alphabetize
+    game_theory.sort()
+
+    # list file names with game_theory/game_generators
+    game_generators_files = glob("../quantecon/game_theory/game_generators/[a-z0-9]*.py")
+    game_generators = list(
+        map(lambda x: x.split('/')[-1][:-3], game_generators_files))
+    # Alphabetize
+    game_generators.sort()
+
+    # list file names with markov
+    markov_files = glob("../quantecon/markov/[a-z0-9]*.py")
+    markov = list(map(lambda x: x.split('/')[-1][:-3], markov_files))
+    # Alphabetize
+    markov.sort()
+
+    # list file names with optimize
+    optimize_files = glob("../quantecon/optimize/[a-z0-9]*.py")
+    optimize = list(map(lambda x: x.split('/')[-1][:-3], optimize_files))
+    # Alphabetize
+    optimize.sort()
+
+    # list file names with random
+    random_files = glob("../quantecon/random/[a-z0-9]*.py")
+    random = list(map(lambda x: x.split('/')[-1][:-3], random_files))
+    # Alphabetize
+    random.sort()
+
+    # list file names of tools (base level modules)
+    tool_files = glob("../quantecon/[a-z0-9]*.py")
+    tools = list(map(lambda x: x.split('/')[-1][:-3], tool_files))
+    # Alphabetize
+    tools.sort()
+
+    # list file names of utilities
+    util_files = glob("../quantecon/util/[a-z0-9]*.py")
+    util = list(map(lambda x: x.split('/')[-1][:-3], util_files))
+    # Alphabetize
+    util.sort()
+
+    # list file names with timings
+    timings_files = glob("../quantecon/timings/[a-z0-9]*.py")
+    timings = list(map(lambda x: x.split('/')[-1][:-3], timings_files))
+    # Alphabetize
+    timings.sort()
+
+    for folder in ["game_theory",
+                   os.path.join("game_theory", "game_generators"),
+                   "markov", "optimize", "random", "timings", "tools",
+                   "util"]:
+        if not os.path.exists(source_join(folder)):
+            os.makedirs(source_join(folder))
+
+    # Write file for each game_theory file
+    for mod in game_theory:
+        new_path = os.path.join("source", "game_theory", mod + ".rst")
+        with open(new_path, "w") as f:
+            equals = "=" * len(mod)
+            f.write(game_theory_module_template.format(mod_name=mod, equals=equals))
+
+    for mod in game_generators:
+        new_path = os.path.join("source", "game_theory", "game_generators", mod + ".rst")
+        with open(new_path, "w") as f:
+            equals = "=" * len(mod)
+            f.write(game_generators_module_template.format(
+                mod_name=mod, equals=equals))
+        #Add sudirectory to flat game_theory list for index file
+        game_theory.append("game_generators/{}".format(mod))
+
+    # Write file for each markov file
+    for mod in markov:
+        new_path = os.path.join("source", "markov", mod + ".rst")
+        with open(new_path, "w") as f:
+            equals = "=" * len(mod)
+            f.write(markov_module_template.format(mod_name=mod, equals=equals))
+
+    # Write file for each optimize file
+    for mod in optimize:
+        new_path = os.path.join("source", "optimize", mod + ".rst")
+        with open(new_path, "w") as f:
+            equals = "=" * len(mod)
+            f.write(optimize_module_template.format(mod_name=mod, equals=equals))
+
+    # Write file for each random file
+    for mod in random:
+        new_path = os.path.join("source", "random", mod + ".rst")
+        with open(new_path, "w") as f:
+            equals = "=" * len(mod)
+            f.write(random_module_template.format(mod_name=mod, equals=equals))
+
+    # Write file for each tool (base level modules)
+    for mod in tools:
+        new_path = os.path.join("source", "tools", mod + ".rst")
+        with open(new_path, "w") as f:
+            write_base_module(mod, f)
+
+    # Write file for each utility
+    for mod in util:
+        new_path = os.path.join("source", "util", mod + ".rst")
+        with open(new_path, "w") as f:
+            equals = "=" * len(mod)
+            f.write(util_module_template.format(mod_name=mod, equals=equals))
+
+    # Write file for each timings module
+    for mod in timings:
+        new_path = os.path.join("source", "timings", mod + ".rst")
+        with open(new_path, "w") as f:
+            equals = "=" * len(mod)
+            f.write(timings_module_template.format(mod_name=mod, equals=equals))
+
+    # write index.rst plus one .rst per section to include autogenerated files
+    with open(source_join("index.rst"), "w") as index:
+        index.write(split_index_template)
+
+    gt = "game_theory/" + "\n   game_theory/".join(game_theory)
+    mark = "markov/" + "\n   markov/".join(markov)
+    opti = "optimize/" + "\n   optimize/".join(optimize)
+    rand = "random/" + "\n   random/".join(random)
+    tmgs = "timings/" + "\n   timings/".join(timings)
+    tlz = "tools/" + "\n   tools/".join(tools)
+    utls = "util/" + "\n   util/".join(util)
+    #-TocTree-#
+    toc_tree_list = {"game_theory": gt,
+                     "markov": mark,
+                     "optimize" : opti,
+                     "tools": tlz,
+                     "random": rand,
+                     "timings": tmgs,
+                     "util": utls,
+                     }
+
+    for f_name in ("game_theory", "markov", "optimize", "random", "timings",
+                   "tools", "util"):
+        with open(source_join(f_name + ".rst"), "w") as f:
+            #Produce Nicer Titles for the multi-word/abbreviated sections
+            title = {"game_theory": "Game Theory",
+                     "util": "Utilities"}.get(f_name, f_name.capitalize())
+            temp = split_file_template.format(name=title,
+                                              equals="="*len(title),
+                                              files=toc_tree_list[f_name])
+            f.write(temp)
+
+if __name__ == '__main__':
+    if "single" in sys.argv[1:]:
+        all_auto()
+    else:
+        model_tool()

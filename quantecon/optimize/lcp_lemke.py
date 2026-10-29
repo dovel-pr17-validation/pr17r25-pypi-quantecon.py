@@ -1,0 +1,402 @@
+"""
+Contain a Numba-jitted linear complementarity problem (LCP) solver based
+on Lemke's algorithm.
+
+"""
+from collections import namedtuple
+import numpy as np
+from numba import jit
+from .pivoting import _pivoting, _lex_min_ratio_test
+from .linprog_simplex import PivOptions, FEA_TOL, TOL_PIV, TOL_RATIO_DIFF
+
+
+LCPResult = namedtuple(
+    'LCPResult', ['z', 'success', 'status', 'num_iter']
+)
+LCPResult.__doc__ = \
+    'namedtuple containing the result from `lcp_lemke`.'
+
+
+# Delete useless docstring for fields of namedtuple
+for field in LCPResult._fields:
+    getattr(LCPResult, field).__doc__ = ''
+
+
+@jit(nopython=True, cache=True)
+def lcp_lemke(M, q, d=None, max_iter=10**6, piv_options=PivOptions(),
+              tableau=None, basis=None, z=None):
+    """
+    Solve the linear complementarity problem::
+
+        z >= 0
+        M @ z + q >= 0
+        z @ (M @ z + q) = 0
+
+    by Lemke's algorithm (with the lexicographic pivoting rule).
+
+    Parameters
+    ----------
+    M : ndarray(float, ndim=2)
+        ndarray of shape (n, n).
+
+    q : ndarray(float, ndim=1)
+        ndarray of shape (n,).
+
+    d : ndarray(float, ndim=1), optional
+        Covering vector, ndarray of shape (n,). Must be strictly
+        positive. If None, default to vector of ones.
+
+    max_iter : int, optional(default=10**6)
+        Maximum number of iterations to perform.
+
+    piv_options : PivOptions, optional
+        PivOptions namedtuple to set the following tolerance values:
+
+            fea_tol : float
+                Feasibility tolerance (default={FEA_TOL}). (Not used in
+                this function.)
+
+            tol_piv : float
+                Pivot tolerance (default={TOL_PIV}).
+
+            tol_ratio_diff : float
+                Tolerance used in the lexicographic pivoting
+                (default={TOL_RATIO_DIFF}).
+
+    tableau : ndarray(float, ndim=2), optional
+        Temporary ndarray of shape (n, 2*n+2) to store the tableau.
+        Modified in place.
+
+    basis : ndarray(int, ndim=1), optional
+        Temporary ndarray of shape (n,) to store the basic variables.
+        Modified in place.
+
+    z : ndarray(float, ndim=1), optional
+        Output ndarray of shape (n,) to store the solution.
+
+    Returns
+    -------
+    res : LCPResult
+        namedtuple consisting of the fields:
+
+            z : ndarray(float, ndim=1)
+                ndarray of shape (n,) containing the solution.
+
+            success : bool
+                True if the algorithm succeeded in finding a solution.
+
+            status : int
+                An integer representing the exit status of the result::
+
+                    0 : Solution found successfully
+                    1 : Iteration limit reached
+                    2 : Secondary ray termination
+                    3 : Numerical difficulties encountered
+
+            num_iter : int
+                The number of iterations performed.
+
+    Examples
+    --------
+    >>> M = np.array([[1, 0, 0], [2, 1, 0], [2, 2, 1]])
+    >>> q = np.array([-8, -12, -14])
+    >>> res = lcp_lemke(M, q)
+    >>> res.success
+    True
+    >>> res.z
+    array([8., 0., 0.])
+    >>> w = M @ res.z + q
+    >>> w
+    array([0., 4., 2.])
+    >>> res.z @ w
+    np.float64(0.0)
+
+    References
+    ----------
+    * K. G. Murty, Linear Complementarity, Linear and Nonlinear
+      Programming, 1988.
+
+    """
+    n = M.shape[0]
+    if d is not None and not np.all(d > 0):
+        raise ValueError('d must be strictly positive')
+
+    success = False
+    status = 1
+    num_iter = 0
+
+    if z is None:
+        z = np.empty(n)
+
+    if (q >= 0).all():  # Trivial case
+        z[:] = 0
+        success = True
+        status = 0
+        return LCPResult(z, success, status, num_iter)
+
+    if d is None:
+        d = np.ones(n)
+    if tableau is None:
+        tableau = np.empty((n, 2*n+2))
+    if basis is None:
+        basis = np.empty(n, dtype=np.int_)
+
+    _initialize_tableau(M, q, d, tableau, basis)
+
+    art_var = 2*n  # Artificial variable
+    pivcol = art_var
+
+    # Equivalent to lex_min_ratio_test: the lexicographic tie breaking
+    # reduces to taking the largest row index, as the slack columns form
+    # the identity matrix. Ties are measured against the minimum ratio
+    # found so far, updated on every strictly smaller ratio, so that the
+    # row chosen is the last one within the tolerance of the minimum.
+    pivrow = 0
+    ratio_min = q[0] / d[0]
+    for i in range(1, n):
+        ratio = q[i] / d[i]
+        if ratio < ratio_min:  # Smaller
+            pivrow = i
+            ratio_min = ratio
+        elif ratio <= ratio_min + piv_options.tol_ratio_diff:  # Tie
+            pivrow = i
+
+    _pivoting(tableau, pivcol, pivrow)
+    basis[pivrow], pivcol = pivcol, pivrow + n
+    num_iter += 1
+
+    # Array to store row indices in lex_min_ratio_test
+    argmins = np.empty(n, dtype=np.int_)
+
+    stop_vars = np.empty(1, dtype=np.int_)
+    stop_vars[0] = art_var
+    status, num_iter_tbl = _lcp_lemke_tbl(
+        tableau, basis, pivcol, stop_vars, max_iter - num_iter, argmins,
+        piv_options.tol_piv, piv_options.tol_ratio_diff
+    )
+    num_iter += num_iter_tbl
+    success = (status == 0)
+
+    _get_solution(tableau, basis, z)
+
+    return LCPResult(z, success, status, num_iter)
+
+
+if lcp_lemke.__doc__ is not None:  # None under python -OO
+    lcp_lemke.__doc__ = lcp_lemke.__doc__.format(
+        FEA_TOL=FEA_TOL, TOL_PIV=TOL_PIV, TOL_RATIO_DIFF=TOL_RATIO_DIFF
+    )
+
+
+@jit(nopython=True, cache=True)
+def _lcp_lemke_tbl(tableau, basis, pivcol, stop_vars, max_iter, argmins,
+                   tol_piv, tol_ratio_diff):
+    """
+    Perform the complementary pivoting steps on an initialized tableau,
+    modifying `tableau` and `basis` in place, until a variable in
+    `stop_vars` leaves the basis.
+
+    The tableau has n rows, one per complementary pair, and its last
+    column holds the values of the basic variables. Columns 0, ..., n-1
+    are those of the slack variables w, which form the identity matrix
+    initially (the lexicographic ratio test reads the basis inverse from
+    them), and columns n, ..., 2n-1 are those of the variables z, so that
+    the complementary pair of variable k is k + n or k - n; further
+    columns, if any, hold additional variables. Starting with `pivcol`
+    entering, the path followed is "almost complementary": after each
+    step, the complement of the variable that has just left enters next,
+    unless the leaving variable is in `stop_vars`, in which case the
+    pivoting ends with success.
+
+    Two uses, which differ only in the initial tableau and `stop_vars`:
+
+    * Lemke's algorithm (Scheme I), as in `lcp_lemke`: the tableau has
+      an extra column for the artificial variable z0 (index 2n), whose
+      covering vector makes the initial basis feasible; z0 enters first
+      (by a ratio test performed by the caller), and `stop_vars` is
+      `[2n]`: the path ends when z0 leaves, where all n pairs are
+      complementary.
+
+    * Lemke paths (Scheme II, or the Lemke-Howson algorithm on a single
+      polytope): the tableau has no artificial column, its initial basis
+      (all w) is feasible and complementary, and `pivcol` is `n + s` for
+      a chosen index s, so that the pair s holds both of its variables
+      while another pair holds none; `stop_vars` is `[s, n + s]`: the
+      path ends when either variable of the pair s leaves, where the
+      basis is complementary again and differs from the initial one.
+
+    Parameters
+    ----------
+    tableau : ndarray(float, ndim=2)
+        ndarray of shape (n, ncols), with ncols >= 2*n+1, containing the
+        initialized tableau, in which the entering variable `pivcol` is
+        nonbasic. Modified in place.
+
+    basis : ndarray(int, ndim=1)
+        ndarray of shape (n,) containing the basic variables. Modified in
+        place.
+
+    pivcol : scalar(int)
+        Index of the variable to enter the basis first.
+
+    stop_vars : ndarray(int, ndim=1)
+        Indices of the variables whose leaving the basis ends the
+        pivoting with success.
+
+    max_iter : scalar(int)
+        Maximum number of pivoting steps to perform.
+
+    argmins : ndarray(int, ndim=1)
+        Workspace ndarray of shape (n,) for the lexicographic ratio
+        test. Modified in place.
+
+    tol_piv : scalar(float)
+        Pivot tolerance below which a number is considered to be
+        nonpositive.
+
+    tol_ratio_diff : scalar(float)
+        Tolerance used in the lexicographic pivoting.
+
+    Returns
+    -------
+    status : scalar(int)
+        Exit status: 0 if a variable in `stop_vars` has left the basis,
+        1 if `max_iter` steps have been performed, 2 if the pivot column
+        has no positive entry (ray termination), 3 if the lexicographic
+        tie breaking failed to single out a row (numerical breakdown).
+
+    num_iter : scalar(int)
+        Number of pivoting steps performed.
+
+    """
+    n = tableau.shape[0]
+
+    status = 1
+    num_iter = 0
+
+    while num_iter < max_iter:
+        pivrow_found, pivrow, resolved = _lex_min_ratio_test(
+            tableau, pivcol, 0, argmins, tol_piv, tol_ratio_diff
+        )
+
+        if not pivrow_found:  # Ray termination
+            status = 2
+            break
+        if not resolved:  # Numerical breakdown: lexicographic tie not
+            status = 3  # broken, impossible in exact arithmetic
+            break
+
+        _pivoting(tableau, pivcol, pivrow)
+        basis[pivrow], leaving_var = pivcol, basis[pivrow]
+        num_iter += 1
+
+        for k in range(stop_vars.shape[0]):
+            if leaving_var == stop_vars[k]:  # Solution found
+                status = 0
+                break
+        if status == 0:
+            break
+        elif leaving_var < n:
+            pivcol = leaving_var + n
+        else:
+            pivcol = leaving_var - n
+
+    return status, num_iter
+
+
+@jit(nopython=True, cache=True)
+def _initialize_tableau(M, q, d, tableau, basis):
+    """
+    Initialize the `tableau` and `basis` arrays in place.
+
+    With covering vector d and artificial variable z0, the LCP is
+    written as
+
+        q = w - M z - d z0
+
+    where the variables are ordered as (w, z, z0). Thus,
+    `tableau[:, :n]` stores I, `tableau[:, n:2*n]` stores -M,
+    `tableau[:, 2*n]` stores -d, and `tableau[:, -1]` stores q, while
+    `basis` stores 0, ..., n-1 (variables w).
+
+    Parameters
+    ----------
+    M : ndarray(float, ndim=2)
+        ndarray of shape (n, n).
+
+    q : ndarray(float, ndim=1)
+        ndarray of shape (n,).
+
+    d : ndarray(float, ndim=1)
+        ndarray of shape (n,).
+
+    tableau : ndarray(float, ndim=2)
+        Empty ndarray of shape (n, 2*n+2) to store the tableau.
+        Modified in place.
+
+    basis : ndarray(int, ndim=1)
+        Empty ndarray of shape (n,) to store the basic variables.
+        Modified in place.
+
+    Returns
+    -------
+    tableau : ndarray(float, ndim=2)
+        View to `tableau`.
+
+    basis : ndarray(int, ndim=1)
+        View to `basis`.
+
+    """
+    n = M.shape[0]
+
+    tableau[:n, :n] = 0
+    for i in range(n):
+        tableau[i, i] = 1
+
+    for i in range(n):
+        for j in range(n):
+            tableau[i, n+j] = -M[i, j]
+
+    for i in range(n):
+        tableau[i, 2*n] = -d[i]
+
+    for i in range(n):
+        tableau[i, -1] = q[i]
+
+    for i in range(n):
+        basis[i] = i
+
+    return tableau, basis
+
+
+@jit(nopython=True, cache=True)
+def _get_solution(tableau, basis, z):
+    """
+    Fetch the solution from `tableau` and `basis`.
+
+    Parameters
+    ----------
+    tableau : ndarray(float, ndim=2)
+        ndarray of shape (n, 2*n+2) containing the terminal tableau.
+
+    basis : ndarray(int, ndim=1)
+        ndarray of shape (n,) containing the terminal basis.
+
+    z : ndarray(float, ndim=1)
+        Empty ndarray of shape (n,) to store the solution. Modified in
+        place.
+
+    Returns
+    -------
+    z : ndarray(float, ndim=1)
+        View to `z`.
+
+    """
+    n = basis.shape[0]
+
+    z[:] = 0
+    for i in range(n):
+        if n <= basis[i] < 2*n:
+            z[basis[i]-n] = tableau[i, -1]
+
+    return z

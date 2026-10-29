@@ -1,0 +1,74 @@
+[build-system]
+requires = ["flit_core >=3.5,<4"]
+build-backend = "flit_core.buildapi"
+
+[project]
+name = "quantecon"
+authors = [{name = "QuantEcon Project", email = "admin@quantecon.org"}]
+classifiers = [
+    'Development Status :: 4 - Beta',
+    'Operating System :: OS Independent',
+    'Intended Audience :: Science/Research',
+    'Programming Language :: Python',
+    'Programming Language :: Python :: 3',
+    'Programming Language :: Python :: 3.12',
+    'Programming Language :: Python :: 3.13',
+    'Programming Language :: Python :: 3.14',
+    'Topic :: Scientific/Engineering',
+]
+keywords = [
+    'quantitative', 
+    'economics'
+]
+dynamic = ["description", "version"]
+requires-python = ">=3.12"
+dependencies = [
+    'numba>=0.56.0',
+    'numpy>=1.17.0',
+    'scipy>=1.5.0',
+]
+
+[project.optional-dependencies]
+# Supports the deprecated quantecon.util.notebooks helpers; removed in v1.0
+# together with the module itself.
+notebooks = [
+    "requests",
+]
+testing = [
+    "pytest",
+    "coverage",
+    "flake8",
+    "numpy",
+    "scipy",
+    "pandas",
+    "numba",
+]
+
+
+[project.license]
+file = "LICENSE"
+
+[project.readme]
+file = "README.md"
+content-type = "text/markdown"
+
+[project.urls]
+Homepage = "https://quantecon.org/quantecon-py/"
+Documentation = "http://quanteconpy.readthedocs.org/en/latest/"
+Funding = "https://quantecon.org"
+Source = "https://github.com/quantecon/QuantEcon.py"
+Tracker = "https://github.com/quantecon/QuantEcon.py/issues"
+
+[tool.flit.module]
+name = "quantecon"
+
+[tool.flit.sdist]
+exclude = [
+  ".*",  # Any hidden folders or files
+  "docs/",
+  "quantecon/tests/",
+  "quantecon/util/tests",
+  "Makefile",
+  "environment.yml",
+  "readthedocs.yml",
+]
